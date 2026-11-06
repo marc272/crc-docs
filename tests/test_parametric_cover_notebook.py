@@ -90,3 +90,14 @@ def test_parametric_notebook_checks_the_module_without_importing_it():
     assert '"parametric" / "__init__.py"' in setup
     assert '"highspy"' in setup
     assert "import crc_sdk" not in setup
+
+
+def test_saved_outputs_say_which_source_they_come_from():
+    notebook = _read()
+    printed = _printed(notebook)
+    note = "About the saved outputs of this copy." in _source(notebook)
+    from_local_file = "Curves come from a local canonical file" in printed
+    from_release = "Curves come from the public CRC Open release" in printed
+    assert from_local_file != from_release
+    # Outputs refreshed from the public release drop the note about a local file.
+    assert note == from_local_file
