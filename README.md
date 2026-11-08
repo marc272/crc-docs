@@ -25,6 +25,11 @@ New to return periods and risk curves? Start with the five-minute primer:
 [Preview](notebooks/climate_risk_curves_primer.ipynb) ·
 [Open in Colab](https://colab.research.google.com/github/RiskThinking/crc-docs/blob/main/notebooks/climate_risk_curves_primer.ipynb).
 
+How does parametric insurance work, and when does it fail to pay? See the
+ten-minute primer, on heavy rain in Toronto:
+[Preview](notebooks/parametric_insurance_primer.ipynb) ·
+[Open in Colab](https://colab.research.google.com/github/RiskThinking/crc-docs/blob/main/notebooks/parametric_insurance_primer.ipynb).
+
 ## Three ways in
 
 - **Ask an AI assistant.** Paste this into Claude, ChatGPT or a coding agent,

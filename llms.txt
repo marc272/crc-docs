@@ -15,6 +15,7 @@ Conventions: return period RP means a value with probability 1/RP of being reach
 ## Learn
 
 - [Climate risk curves in five minutes](notebooks/climate_risk_curves_primer.ipynb): reading return-period curves, sampling uncertainty, lifetime chance, one recipe for many hazards
+- [Parametric insurance in ten minutes](notebooks/parametric_insurance_primer.ipynb): a cover as a function of a hazard index, how often it pays, basis risk, premiums, designing a cover for a stated goal and testing it out of sample; crc_sdk.parametric on CRC Open rx1day (SSP5-8.5) for an illustrative Toronto site
 
 ## Optional
 
