@@ -15,6 +15,7 @@ Conventions: return period RP means a value with probability 1/RP of being reach
 ## Learn
 
 - [Climate risk curves in five minutes](notebooks/climate_risk_curves_primer.ipynb): reading return-period curves, sampling uncertainty, lifetime chance, one recipe for many hazards
+- [Which index should it pay on?](notebooks/which_index_should_it_pay_on.ipynb): a parametric cover's index compared on real years; the primer's cover on ERA5's 1.5° cell, 1959-2021, and the July 2013 Toronto storm it missed; covers on the one-day and five-day rain, and one contract on both, designed for one goal and budget against one stated loss, out of sample with pooled k-fold metrics and bootstrap intervals; crc_sdk.parametric index components (sample_annual_hazards), StepGrid, compare_pooled and bootstrap_intervals, with CRC Open rx1day (SSP5-8.5) for the primer's design years, for an illustrative Toronto site
 
 ## Optional
 
