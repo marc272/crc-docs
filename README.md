@@ -25,6 +25,10 @@ New to return periods and risk curves? Start with the five-minute primer:
 [Preview](notebooks/climate_risk_curves_primer.ipynb) ·
 [Open in Colab](https://colab.research.google.com/github/RiskThinking/crc-docs/blob/main/notebooks/climate_risk_curves_primer.ipynb).
 
+What does more premium buy in a parametric cover? A short showcase, on heavy rain
+in Toronto: [Preview](notebooks/what_does_more_premium_buy.ipynb) ·
+[Open in Colab](https://colab.research.google.com/github/marc272/crc-docs/blob/parametric/notebooks/what_does_more_premium_buy.ipynb).
+
 ## Three ways in
 
 - **Ask an AI assistant.** Paste this into Claude, ChatGPT or a coding agent,
