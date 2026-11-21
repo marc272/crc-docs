@@ -25,6 +25,11 @@ New to return periods and risk curves? Start with the five-minute primer:
 [Preview](notebooks/climate_risk_curves_primer.ipynb) ·
 [Open in Colab](https://colab.research.google.com/github/RiskThinking/crc-docs/blob/main/notebooks/climate_risk_curves_primer.ipynb).
 
+How does crc-sdk's parametric module design and test a cover? See how the module
+works, from one plan to the functions underneath:
+[Preview](notebooks/parametric_insurance_module.ipynb) ·
+[Open in Colab](https://colab.research.google.com/github/marc272/crc-docs/blob/parametric/notebooks/parametric_insurance_module.ipynb).
+
 ## Three ways in
 
 - **Ask an AI assistant.** Paste this into Claude, ChatGPT or a coding agent,
