@@ -20,7 +20,8 @@ Run from the repository root:
 
 ``--bounds`` is ``min_lon min_lat max_lon max_lat`` (default: Florida).
 Outputs land in ``--output`` (default ``pipeline_output/company``):
-``summary.json`` and ``locations.csv``. Overture places show where a brand
+``summary.json``, ``locations.csv`` and ``locations.geojson`` (one point per
+location, for the crc-viz hazard map). Overture places show where a brand
 operates; they are not evidence of ownership, value or insurance. See
 ``notebooks/how_exposed_is_this_company.ipynb`` for the explained version.
 """
@@ -31,6 +32,7 @@ import argparse
 import csv
 import json
 import os
+import sys
 import tempfile
 import urllib.request
 import warnings
@@ -54,6 +56,27 @@ HAZARDS = {
     "hot_days": "hot days",
 }
 EARLY, LATE = (2025, 2030, 2035), (2070, 2075, 2080)
+# Per-location property names on the map. They carry the years but no unit (the
+# map declares the unit, % of building value per year, in crc-viz's fieldInfo),
+# and avoid hazard words such as "cyclone" or "rain": crc-viz reads those as a
+# hazard measurement and shows its unit (m/s, mm).
+PROPERTY_HAZARDS = {
+    "cyclone": "storm",
+    "rx1day": "downpour",
+    "hot_days": "hot_weather",
+    "total": "total",
+}
+PROPERTY_WINDOWS = {
+    "early": f"{EARLY[0]}_{EARLY[-1]}",
+    "late": f"{LATE[0]}_{LATE[-1]}",
+}
+
+
+def damage_property(hazard: str, window: str) -> str:
+    """Map property for one hazard (or "total") and window, e.g. total_damage_2070_2080."""
+    return f"{PROPERTY_HAZARDS[hazard]}_damage_{PROPERTY_WINDOWS[window]}"
+
+
 # Midpoints of 200 equal probability slices; the mean over them is the
 # expected (average-year) damage. Values beyond 1-in-400 are left out.
 PROBABILITIES = (np.arange(200) + 0.5) / 200
@@ -327,11 +350,14 @@ def crc_open_answer(
         "per_location_pct": {
             a: {
                 **{
-                    f"{h}_{w}": round(100 * per_hazard[h][w][i], 3)
+                    damage_property(h, w): round(100 * per_hazard[h][w][i], 3)
                     for h in HAZARDS
                     for w in total
                 },
-                **{f"total_{w}": round(100 * total[w][i], 3) for w in total},
+                **{
+                    damage_property("total", w): round(100 * total[w][i], 3)
+                    for w in total
+                },
             }
             for i, a in enumerate(ids)
         },
@@ -425,6 +451,77 @@ def write_atomic(path: Path, text: str) -> None:
     ) as handle:
         handle.write(text)
     os.replace(handle.name, path)
+
+
+def locations_geojson(
+    rows: list[dict[str, Any]],
+    counts: list[int] | None,
+    per_location: dict[str, dict[str, float]],
+    since: int,
+) -> dict[str, Any]:
+    """One Point per location, ready for the crc-viz hazard map.
+
+    Colour the map by ``hurricanes_within_50km_since_<year>`` (when hurricanes
+    were not skipped) or by any of the expected-damage fields (% of value).
+    """
+    count_key = f"hurricanes_within_{RADIUS_KM}km_since_{since}"
+    features = []
+    for i, row in enumerate(rows):
+        properties = {
+            k: v for k, v in row.items() if k not in ("longitude", "latitude")
+        }
+        if counts:
+            properties[count_key] = counts[i]
+        properties.update(per_location.get(row["asset_id"], {}))
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": {
+                    "type": "Point",
+                    "coordinates": [row["longitude"], row["latitude"]],
+                },
+                "properties": properties,
+            }
+        )
+    return {"type": "FeatureCollection", "features": features}
+
+
+def build_map(output: Path) -> Path | None:
+    """Build the crc-viz hazard map page when the bundle is available locally.
+
+    Needs the repository's ``tools/build_map_page.py``; a downloaded copy of this
+    script alone skips the map (the skill then runs that tool itself).
+    """
+    root = Path(__file__).resolve().parents[1]
+    if not (root / "tools" / "build_map_page.py").is_file():
+        return None
+    sys.path.insert(0, str(root))
+    try:
+        from tools.build_map_page import build, find_bundle
+    except ImportError:
+        return None
+    viz = find_bundle(download=False)
+    if viz is None:
+        return None
+    return build(
+        output / "locations.geojson", viz, output / "map", "Locations on the CRC map"
+    )
+
+
+def live_map_link(geojson: Path) -> str | None:
+    """Link to the hosted map viewer with every location packed into the #fragment.
+
+    Needs no bundle, only the repository's ``tools/build_map_page.py``.
+    """
+    root = Path(__file__).resolve().parents[1]
+    if not (root / "tools" / "build_map_page.py").is_file():
+        return None
+    sys.path.insert(0, str(root))
+    try:
+        from tools.build_map_page import encode_link
+    except ImportError:
+        return None
+    return encode_link(json.loads(geojson.read_text()))
 
 
 def headline(brand: str, places: dict, storms: dict, crc: dict, cdt: dict) -> str:
@@ -552,7 +649,27 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
                     ]
                 )
         os.replace(handle.name, args.output / "locations.csv")
+        write_atomic(
+            args.output / "locations.geojson",
+            json.dumps(
+                locations_geojson(rows, storms.get("counts"), per_location, args.since)
+            ),
+        )
     print(answer)
+    if places["available"]:
+        page = build_map(args.output)
+        link = live_map_link(args.output / "locations.geojson")
+        if link:
+            print(f"Live map: {link}")
+        if page:
+            print(
+                f"Map: {page.resolve()} (one self-contained file; open it in a browser)"
+            )
+        else:
+            print(
+                f"No map built (crc-viz bundle not found); open {args.output}/"
+                "locations.geojson in QGIS or geojson.io."
+            )
     return summary
 
 
