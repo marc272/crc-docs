@@ -1,0 +1,514 @@
+"""Write one self-contained HTML page that shows a locations GeoJSON on the crc-viz hazard map.
+
+The company pipeline writes ``locations.geojson``. This turns it into a single
+``index.html`` with the crc-viz browser bundle (script, styles and MapLibre
+worker) and the data all inline. Open it by double-clicking, email it, or host
+it anywhere. It needs a real browser tab (best served over http: add
+``--serve`` to open a live link on localhost) and internet for the Carto basemap tiles.
+
+The bundle is committed under ``assets/crc-viz`` (rebuild it from the npm package with
+``npm run build`` in ``tools/crc-viz-bundle``). A copy of this script on its
+own downloads it from GitHub. Then:
+
+    uv run python tools/build_map_page.py pipeline_output/company/locations.geojson \\
+        --output pipeline_output/company/map
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import functools
+import http.server
+import json
+import os
+import re
+import tempfile
+import urllib.request
+import webbrowser
+import zlib
+from pathlib import Path
+from typing import Any
+
+# Where a standalone copy of this script downloads the bundle from. Point
+# CRC_VIZ_BASE_URL elsewhere (a release, a CDN) to use another build.
+BUNDLE_URL = (
+    "https://raw.githubusercontent.com/RiskThinking/crc-docs/main/assets/crc-viz"
+)
+BUNDLE_FILES = ("crc-viz.js", "crc-viz.css")
+# Expected yearly damage per location, averaged over the early and late windows
+# the pipeline uses (EARLY and LATE in pipelines/how_exposed_is_this_company.py).
+DAMAGE_KEYS = ("total_damage_2025_2035", "total_damage_2070_2080")
+HAZARD_NAMES = {
+    "storm": "Hurricane wind damage",
+    "downpour": "Heavy rain damage",
+    "hot_weather": "Hot days damage",
+    "total": "Total expected damage",
+}
+WINDOW_YEARS = ("2025_2035", "2070_2080")
+# Sites from pipelines/which_sites_are_most_at_risk.py: 1-in-10-year value per hazard
+# in each window (<hazard>_<years>) and the change between them (<hazard>_change).
+SITE_HAZARDS = {
+    "tx_max": ("Hottest day", "°C"),
+    "rx1day": ("Wettest day", "mm"),
+    "hot_days": ("Hot days", "days"),
+    "fwi": ("Wildfire weather", "Fire Weather Index"),
+}
+SITE_WINDOWS = {"2025_2035": "2025-2035", "2070_2080": "2070-2080", "change": "change"}
+# CDT sites (.agents/skills/which-sites-are-most-at-risk): <hazard>_change is the SSP5-8.5
+# change from the historical baseline; <hazard>_baseline, <hazard>_<pathway>_2070_2090 and
+# <hazard>_<pathway>_change are the baseline, the 2070-2090 value and the change per pathway.
+# CDT does not return the Fire Weather Index.
+CDT_PATHWAYS = {"ssp126": "SSP1-2.6", "ssp245": "SSP2-4.5", "ssp585": "SSP5-8.5"}
+CDT_HAZARDS = tuple(h for h in SITE_HAZARDS if h != "fwi")
+# CRC Open sites (tx_max_2070_2080) never have these in a field name; CDT sites always do.
+CDT_KEY = r"_ssp|_2070_2090$|_historic_|_baseline$"
+SITE_TITLE = "Hottest day, change to 2070-2080"
+CDT_SITE_TITLE = "Hottest day, SSP5-8.5 change to 2070-2090"
+HURRICANE_COLOURS = ["#fff7ec", "#fdd49e", "#fc8d59", "#d7301f", "#7f0000"]
+
+PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+{css}
+  html, body {{ height: 100%; margin: 0; font-family: system-ui, sans-serif; }}
+  #map {{ height: 100%; position: relative; z-index: 1; }}
+</style>
+</head>
+<body>
+<div id="fallback" style="position:fixed;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;padding:24px;color:#444;background:#f6f6f6">
+  <p>This map needs a browser to run. If you only see this message, the preview panel is blocking scripts.<br>Download the file and open it in Chrome, Safari or Firefox.</p>
+</div>
+<div id="map"></div>
+<script>
+  // If the map cannot start (a sandboxed preview can block workers, requests or
+  // WebGL), say why on the page instead of leaving it blank.
+  (function () {{
+    var problems = [];
+    function show() {{
+      var box = document.getElementById("map-problems");
+      if (!box) {{
+        box = document.createElement("pre");
+        box.id = "map-problems";
+        box.style.cssText = "position:fixed;left:8px;bottom:8px;right:8px;max-height:40%;overflow:auto;margin:0;padding:8px;background:#fff3f0;border:1px solid #cc5b38;color:#67000d;font:12px/1.4 monospace;white-space:pre-wrap;z-index:9999";
+        document.body.appendChild(box);
+      }}
+      box.textContent = "Map problem. If this is a preview panel, download the file and open it in a browser.\\n" + problems.join("\\n");
+    }}
+    function add(text) {{ problems.push(text); show(); }}
+    window.addEventListener("error", function (e) {{ add("error: " + e.message); }});
+    window.addEventListener("unhandledrejection", function (e) {{ add("rejected: " + (e.reason && e.reason.message || e.reason)); }});
+    document.addEventListener("securitypolicyviolation", function (e) {{ add("blocked by " + e.violatedDirective + ": " + String(e.blockedURI).slice(0, 80)); }});
+    setTimeout(function () {{
+      if (!document.querySelector(".maplibregl-canvas")) add("the map never started (page origin: " + location.origin + ")");
+    }}, 6000);
+  }})();
+</script>
+<script>{js}</script>
+<script>
+  const layers = {layers};
+{boot}
+</script>
+</body>
+</html>
+"""
+
+
+STATIC_BOOT = """  const data = {data};
+  CrcViz.mountHazardMap(document.getElementById("map"), {{ source: data, layers, controlsPlacement: "overlay-top-right" }});"""
+
+# The hosted viewer reads its locations from the link (#<data>): raw-deflate JSON,
+# base64url, as {"k": [numeric keys], "r": [[lon, lat, city, value per key], ...]}.
+# Every numeric field travels, so all of them are offered as colour fields.
+HURRICANE_PLACEHOLDER = "__hurricanes__"
+VIEWER_BOOT = """  const hint = document.getElementById("fallback");
+  async function load() {{
+    const text = location.hash.slice(1).replace(/-/g, "+").replace(/_/g, "/");
+    if (!text) throw new Error("This page needs a map link with data after the # sign.");
+    const bytes = Uint8Array.from(atob(text), function (c) {{ return c.charCodeAt(0); }});
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+    return JSON.parse(await new Response(stream).text());
+  }}
+  load().then(function (pack) {{
+    const hurricanes = pack.k.find(function (k) {{ return k.indexOf("hurricanes_within_") === 0; }}) || "";
+    const kind = hurricanes || pack.k.indexOf("tx_max_change") < 0 ? "hurricanes" : "sites";
+    const config = JSON.parse(JSON.stringify(layers[kind]).split("{placeholder}").join(hurricanes));
+    if (kind === "sites") {{
+      const hazards = {hazards};
+      const layer = config[0];
+      if (pack.k.some(function (k) {{ return new RegExp({cdt_key}).test(k); }})) layer.title = {cdt_title};
+      pack.k.forEach(function (k) {{
+        if (layer.fieldInfo[k]) return;
+        Object.keys(hazards).some(function (h) {{
+          if (k !== h && k.indexOf(h + "_") !== 0) return false;
+          const label = (hazards[h][0] + " " + k.slice(h.length + 1).replace(/_/g, " ")).trim();
+          layer.fieldInfo[k] = {{ label: label, unit: hazards[h][1] }};
+          layer.tooltip.keyAliases[k] = label;
+          return true;
+        }});
+      }});
+    }}
+    const data = {{ type: "FeatureCollection", features: pack.r.map(function (r) {{
+      const properties = {{ city: r[2], title: r[2] }};
+      pack.k.forEach(function (k, i) {{ properties[k] = r[3 + i]; }});
+      return {{ type: "Feature", geometry: {{ type: "Point", coordinates: [r[0], r[1]] }}, properties: properties }};
+    }}) }};
+    hint.remove();
+    CrcViz.mountHazardMap(document.getElementById("map"), {{ source: data, layers: config, controlsPlacement: "overlay-top-right" }});
+  }}).catch(function (e) {{ hint.textContent = "Could not read the map data: " + e.message; }});"""
+
+LINK_URL = "https://riskthinking.github.io/crc-docs/map/"
+
+
+def encode_link(geojson: dict[str, Any], base: str = LINK_URL) -> str:
+    """A link to the hosted viewer with every location packed into the #fragment."""
+    features = geojson.get("features") or []
+    keys: list[str] = []
+    for feature in features:
+        for key, value in feature.get("properties", {}).items():
+            numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
+            if numeric and key not in keys and not key.endswith("_id"):
+                keys.append(key)
+    rows = []
+    for feature in features:
+        props = feature.get("properties", {})
+        lon, lat = feature["geometry"]["coordinates"][:2]
+        values = [
+            round(props[key], 4)
+            if isinstance(props.get(key), float)
+            else props.get(key)
+            for key in keys
+        ]
+        rows.append(
+            [
+                round(lon, 3),
+                round(lat, 3),
+                props.get("title") or props.get("city") or props.get("name") or "",
+            ]
+            + values
+        )
+    text = json.dumps({"k": keys, "r": rows}, separators=(",", ":"), ensure_ascii=False)
+    packer = zlib.compressobj(9, zlib.DEFLATED, -15)
+    packed = packer.compress(text.encode()) + packer.flush()
+    return base + "#" + base64.urlsafe_b64encode(packed).decode().rstrip("=")
+
+
+def decode_link(link: str) -> dict[str, Any]:
+    text = link.split("#", 1)[1]
+    packed = base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+    return json.loads(zlib.decompress(packed, -15))
+
+
+def key_aliases(hurricanes: str | None = None) -> dict[str, str]:
+    """Readable tooltip labels, without units (the units live in ``fieldInfo``)."""
+    aliases = {
+        f"{hazard}_damage_{years}": f"{name} {years.replace('_', '-')}"
+        for hazard, name in HAZARD_NAMES.items()
+        for years in WINDOW_YEARS
+    }
+    if hurricanes:
+        aliases[hurricanes] = "Hurricanes within 50 km"
+    return aliases
+
+
+def site_field_info() -> dict[str, dict[str, str]]:
+    """Label and unit per site field: CRC Open windows plus CDT pathway changes."""
+    info = {
+        f"{hazard}_{window}": {"label": f"{name} {label}", "unit": unit}
+        for hazard, (name, unit) in SITE_HAZARDS.items()
+        for window, label in SITE_WINDOWS.items()
+    }
+    for hazard in CDT_HAZARDS:
+        name, unit = SITE_HAZARDS[hazard]
+        info[f"{hazard}_baseline"] = {"label": f"{name} baseline", "unit": unit}
+        for pathway, label in CDT_PATHWAYS.items():
+            info[f"{hazard}_{pathway}_2070_2090"] = {
+                "label": f"{name} {label} 2070-2090",
+                "unit": unit,
+            }
+            info[f"{hazard}_{pathway}_change"] = {
+                "label": f"{name} {label} change",
+                "unit": unit,
+            }
+    return info
+
+
+def extra_site_field_info(props: dict[str, Any]) -> dict[str, dict[str, str]]:
+    """Units for site fields the fixed list misses (e.g. ``tx_max_historic_2010``).
+
+    crc-viz falls back to its own unit for a field with no ``fieldInfo`` entry, and
+    that unit for ``tx_max`` is K. Any numeric field named after a site hazard gets
+    that hazard's unit here, so the map never shows K for values written in °C.
+    """
+    known = site_field_info()
+    extra = {}
+    for key, value in props.items():
+        if key in known or not isinstance(value, (int, float)):
+            continue
+        for hazard, (name, unit) in SITE_HAZARDS.items():
+            if key == hazard or key.startswith(f"{hazard}_"):
+                rest = key[len(hazard) + 1 :].replace("_", " ")
+                extra[key] = {"label": f"{name} {rest}".strip(), "unit": unit}
+                break
+    return extra
+
+
+def site_aliases() -> dict[str, str]:
+    return {key: info["label"] for key, info in site_field_info().items()}
+
+
+def site_layer(props: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Colour sites by how much the hottest day warms; every other field is selectable."""
+    extra = extra_site_field_info(props or {})
+    cdt = any(re.search(CDT_KEY, key) for key in props or {})
+    return {
+        "id": "points",
+        "visKey": "tx_max_change",
+        "title": CDT_SITE_TITLE if cdt else SITE_TITLE,
+        "unit": "°C",
+        "fieldInfo": {**site_field_info(), **extra},
+        "radius": 8,
+        "tooltip": {
+            "titleKey": "title",
+            "valueKeys": [f"{h}_change" for h in SITE_HAZARDS],
+            "keyAliases": {
+                **site_aliases(),
+                **{k: v["label"] for k, v in extra.items()},
+            },
+        },
+    }
+
+
+def field_info(hurricanes: str | None = None) -> dict[str, dict[str, str]]:
+    """Label and unit per field for crc-viz's ``fieldInfo``: damage is % of value."""
+    info = {
+        key: {"label": label, "unit": "% of value per year"}
+        for key, label in key_aliases().items()
+    }
+    if hurricanes:
+        info[hurricanes] = {"label": "Hurricanes within 50 km", "unit": ""}
+    return info
+
+
+def layer_config(geojson: dict[str, Any]) -> list[dict[str, Any]]:
+    """Colour points by hurricane count, site climate change, else late-century damage."""
+    props: dict[str, Any] = {}  # every field on any feature; the first value wins
+    for feature in geojson.get("features") or []:
+        for key, value in feature.get("properties", {}).items():
+            props.setdefault(key, value)
+    hurricanes = next((k for k in props if k.startswith("hurricanes_within_")), None)
+    if "tx_max_change" in props and not hurricanes:
+        return [site_layer(props)]
+    if hurricanes:
+        return [
+            {
+                "id": "points",
+                "visKey": hurricanes,
+                "title": "Hurricanes within 50 km",
+                "unit": "",
+                "fieldInfo": field_info(hurricanes),
+                "colorScheme": HURRICANE_COLOURS,
+                "radius": 6,
+                "tooltip": {
+                    "titleKey": "city",
+                    "valueKeys": [hurricanes, *DAMAGE_KEYS],
+                    "keyAliases": key_aliases(hurricanes),
+                },
+            }
+        ]
+    if DAMAGE_KEYS[1] in props:
+        return [
+            {
+                "id": "points",
+                "visKey": DAMAGE_KEYS[1],
+                "title": "Expected yearly damage, 2070-2080",
+                "unit": "% of value",
+                "fieldInfo": field_info(),
+                "radius": 6,
+                "tooltip": {
+                    "titleKey": "city",
+                    "valueKeys": list(DAMAGE_KEYS),
+                    "keyAliases": key_aliases(),
+                },
+            }
+        ]
+    return []
+
+
+def find_bundle(explicit: Path | None = None, download: bool = True) -> Path | None:
+    """Folder holding the crc-viz browser bundle, or None.
+
+    Looks at ``explicit``, ``$CRC_VIZ_BROWSER``, the repository's
+    ``assets/crc-viz`` and a sibling crc-viz checkout (``../crc-viz/dist/browser``).
+    Otherwise downloads it from ``$CRC_VIZ_BASE_URL`` (default: BUNDLE_URL).
+    """
+    here = Path(__file__).resolve().parents[1]
+    candidates = [
+        explicit,
+        Path(os.environ["CRC_VIZ_BROWSER"])
+        if os.environ.get("CRC_VIZ_BROWSER")
+        else None,
+        here / "assets" / "crc-viz",
+        Path("../crc-viz/dist/browser"),
+    ]
+    for folder in candidates:
+        if folder and (folder / BUNDLE_FILES[0]).is_file():
+            return folder
+    if not download:
+        return None
+    base = os.environ.get("CRC_VIZ_BASE_URL", BUNDLE_URL).rstrip("/")
+    folder = Path(tempfile.mkdtemp(prefix="crc-viz-"))
+    try:
+        for name in BUNDLE_FILES:
+            with urllib.request.urlopen(f"{base}/{name}", timeout=60) as response:
+                (folder / name).write_bytes(response.read())
+    except OSError as error:
+        print(f"Could not download the crc-viz bundle from {base}: {error}")
+        return None
+    return folder
+
+
+def write_atomic(path: Path, text: str) -> None:
+    with tempfile.NamedTemporaryFile(
+        "w", dir=path.parent, delete=False, suffix=".tmp"
+    ) as handle:
+        handle.write(text)
+    os.chmod(handle.name, 0o644)
+    os.replace(handle.name, path)
+
+
+def build(geojson_path: Path, viz: Path, output: Path, title: str) -> Path:
+    if not (viz / "crc-viz.js").is_file():
+        raise SystemExit(
+            f"{viz}/crc-viz.js not found. Run `npm run build` in tools/crc-viz-bundle first."
+        )
+    geojson = json.loads(geojson_path.read_text())
+    output.mkdir(parents=True, exist_ok=True)
+    # "</" inside an inline script or style block would end it early.
+    data = json.dumps(geojson, separators=(",", ":")).replace("</", "<\\/")
+    js = (viz / "crc-viz.js").read_text().replace("</script", "<\\/script")
+    css = (viz / "crc-viz.css").read_text().replace("</style", "<\\/style")
+    page = PAGE.format(
+        title=title,
+        css=css,
+        js=js,
+        layers=json.dumps(layer_config(geojson), indent=2),
+        boot=STATIC_BOOT.format(data=data),
+    )
+    write_atomic(output / "index.html", page)
+    return output / "index.html"
+
+
+def serve(folder: Path, port: int = 8000, open_browser: bool = True) -> None:
+    """Serve ``folder`` on localhost, print the link and open it. Stops on Ctrl-C."""
+    handler = functools.partial(
+        http.server.SimpleHTTPRequestHandler, directory=str(folder)
+    )
+    server = None
+    for candidate in range(port, port + 20):
+        try:
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", candidate), handler)
+            break
+        except OSError:
+            continue
+    if server is None:
+        raise SystemExit(f"No free port between {port} and {port + 19}.")
+    url = f"http://localhost:{server.server_port}/index.html"
+    print(f"Live map: {url}  (Ctrl-C to stop)", flush=True)
+    if open_browser:
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+def build_viewer(viz: Path, output: Path) -> Path:
+    """Write the hosted viewer (for GitHub Pages) that draws the map from its link."""
+    # layer_config looks for a key that starts with "hurricanes_within_".
+    sample = {
+        "features": [{"properties": {"hurricanes_within_" + HURRICANE_PLACEHOLDER: 0}}]
+    }
+    page = PAGE.format(
+        title="Locations on the CRC hazard map",
+        css=(viz / "crc-viz.css").read_text().replace("</style", "<\\/style"),
+        js=(viz / "crc-viz.js").read_text().replace("</script", "<\\/script"),
+        layers=json.dumps(
+            {
+                "hurricanes": layer_config(sample),
+                "sites": [site_layer()],
+            },
+            indent=2,
+        ),
+        boot=VIEWER_BOOT.format(
+            placeholder="hurricanes_within_" + HURRICANE_PLACEHOLDER,
+            hazards=json.dumps(SITE_HAZARDS),
+            cdt_key=json.dumps(CDT_KEY),
+            cdt_title=json.dumps(CDT_SITE_TITLE),
+        ),
+    )
+    output.mkdir(parents=True, exist_ok=True)
+    write_atomic(output / "index.html", page)
+    return output / "index.html"
+
+
+def main(argv: list[str] | None = None) -> Path:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("geojson", type=Path, nargs="?")
+    parser.add_argument(
+        "--viz",
+        type=Path,
+        help="folder with crc-viz.js and crc-viz.css (default: find or download)",
+    )
+    parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--link",
+        action="store_true",
+        help="print a link to the hosted viewer with the locations packed into it",
+    )
+    parser.add_argument(
+        "--viewer",
+        type=Path,
+        metavar="FOLDER",
+        help="write the hosted viewer page into FOLDER (publish it on GitHub Pages)",
+    )
+    parser.add_argument("--title", default="Locations on the CRC hazard map")
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="after building, serve the page on localhost and open it in the browser",
+    )
+    parser.add_argument("--port", type=int, default=8000, help="first port to try")
+    args = parser.parse_args(argv)
+    if args.link:
+        if not args.geojson:
+            raise SystemExit("--link needs the locations.geojson path.")
+        link = encode_link(json.loads(args.geojson.read_text()))
+        print(f"Live map: {link}")
+        return Path(link)
+    viz = find_bundle(args.viz)
+    if viz is None:
+        raise SystemExit("No crc-viz bundle found or downloadable; see --viz.")
+    if args.viewer:
+        page = build_viewer(viz, args.viewer)
+        print(f"Wrote {page}.")
+        return page
+    if not args.geojson or not args.output:
+        raise SystemExit("Give the locations.geojson path and --output.")
+    page = build(args.geojson, viz, args.output, args.title)
+    print(f"Wrote {page}.")
+    if args.serve:
+        serve(args.output, args.port)
+    return page
+
+
+if __name__ == "__main__":
+    main()
