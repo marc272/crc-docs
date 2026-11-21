@@ -25,6 +25,10 @@ New to return periods and risk curves? Start with the five-minute primer:
 [Preview](notebooks/climate_risk_curves_primer.ipynb) ·
 [Open in Colab](https://colab.research.google.com/github/RiskThinking/crc-docs/blob/main/notebooks/climate_risk_curves_primer.ipynb).
 
+Which index should a parametric cover pay on? A short showcase, on heavy rain in
+Toronto and ERA5's real years: [Preview](notebooks/which_index_should_it_pay_on.ipynb) ·
+[Open in Colab](https://colab.research.google.com/github/marc272/crc-docs/blob/parametric/notebooks/which_index_should_it_pay_on.ipynb).
+
 ## Three ways in
 
 - **Ask an AI assistant.** Paste this into Claude, ChatGPT or a coding agent,
